@@ -21,6 +21,7 @@ var caCert *x509.Certificate
 var caKey crypto.PrivateKey
 
 func main() {
+	go startControlPlane()
 	// Load CA certificate and key
 	caCertFile, err := os.ReadFile("internal-ca.crt")
 	if err != nil {
@@ -56,7 +57,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
-	log.Println("Enrollment server running")
+	log.Println("Enrollment server running on :8443")
 
 	for {
 		c, err := ln.Accept()
@@ -159,4 +160,60 @@ func handleEnroll(c net.Conn) {
 		log.Printf("failed to write response: %v", err)
 	}
 
+}
+func startControlPlane() {
+	caPEM, _ := os.ReadFile("internal-ca.crt")
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(caPEM)
+
+	serverCert, _ := tls.LoadX509KeyPair("server-mtls.crt", "server-mtls.key")
+
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    caPool,
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	ln, err := tls.Listen("tcp", ":9443", cfg)
+	if err != nil {
+		log.Fatal("control plane listen:", err)
+	}
+
+	log.Println("🔐 Control plane (mTLS) on :9443")
+
+	for {
+		c, _ := ln.Accept()
+		go handleControl(c)
+	}
+}
+
+func handleControl(c net.Conn) {
+	tlsConn := c.(*tls.Conn)
+	defer tlsConn.Close()
+
+	if err := tlsConn.Handshake(); err != nil {
+		log.Println("handshake:", err)
+		return
+	}
+
+	cert := tlsConn.ConnectionState().PeerCertificates[0]
+	log.Printf("🔐 Control connect: %s", cert.Subject.CommonName)
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := tlsConn.Read(buf)
+		if err != nil {
+			log.Println("control disconnected:", err)
+			return
+		}
+
+		log.Println("control recv:", string(buf[:n]))
+
+		_, err = tlsConn.Write([]byte(`{"type":"pong"}` + "\n"))
+		if err != nil {
+			log.Println("write failed:", err)
+			return
+		}
+	}
 }

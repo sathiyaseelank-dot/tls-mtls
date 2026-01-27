@@ -13,6 +13,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"time"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -74,6 +75,21 @@ func main() {
 	}
 	defer rwc.Close()
 	log.Println("✓ TPM opened")
+
+	// Try to load persistent key first
+	loadPersist := tpm2.ReadPublic{
+		ObjectHandle: tpm2.TPMHandle(0x81000001),
+	}
+	persistRsp, persistErr := loadPersist.Execute(rwc)
+	if persistErr == nil {
+		log.Println("✓ Persistent key found at handle 0x81000001")
+		// Use persistent key instead of creating a new one
+		keyHandle := tpm2.TPMHandle(0x81000001)
+		keyName := persistRsp.Name
+		_ = keyHandle
+		_ = keyName
+		log.Println("✓ Persistent key loaded")
+	}
 
 	// Create primary key under Owner hierarchy
 	inPublic := tpm2.New2B(tpm2.RSASRKTemplate)
@@ -154,6 +170,34 @@ func main() {
 	}()
 	log.Println("✓ Enrollment key created and loaded in TPM")
 
+	// Evict old persistent key if it exists
+	evict := tpm2.EvictControl{
+		Auth: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		ObjectHandle: &tpm2.NamedHandle{
+			Handle: tpm2.TPMHandle(0x81000001),
+		},
+		PersistentHandle: tpm2.TPMHandle(0x81000001),
+	}
+	evict.Execute(rwc) // ignore error if key doesn't exist
+
+	persist := tpm2.EvictControl{
+		Auth: tpm2.AuthHandle{
+			Handle: tpm2.TPMRHOwner,
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		ObjectHandle: &tpm2.NamedHandle{
+			Handle: keyHandle,
+			Name:   keyName,
+		},
+		PersistentHandle: tpm2.TPMHandle(0x81000001),
+	}
+	if _, err := persist.Execute(rwc); err != nil {
+		log.Fatal("persist failed:", err)
+	}
+	log.Println("✓ Enrollment key persisted at handle 0x81000001")
 	// Extract public key for CSR signing
 	pubArea, err := createRsp.OutPublic.Contents()
 	if err != nil {
@@ -232,17 +276,22 @@ func main() {
 	log.Printf("✓ Received %d bytes (client.crt + internal-ca.crt)", len(bundle))
 
 	// Store certificates and key in TPM
-	err = storeInTPM(rwc, primaryHandle, primaryName, bundle, createRsp.OutPrivate, createRsp.OutPublic)
+	clientCertObj, err := storeInTPM(rwc, primaryHandle, primaryName, bundle, createRsp.OutPrivate, createRsp.OutPublic)
 	if err != nil {
 		log.Fatalf("failed to store in TPM: %v", err)
 	}
 
 	log.Println("✓ Enrollment complete!")
 	log.Println("✓ Certificates and key stored in TPM")
+
+	go controlLoop(clientCertObj, signer)
+
+	select {} // block forever
+
 }
 
 func storeInTPM(rwc transport.TPM, parentHandle tpm2.TPMHandle, parentName tpm2.TPM2BName,
-	bundle []byte, outPrivate tpm2.TPM2BPrivate, outPublic tpm2.TPM2BPublic) error {
+	bundle []byte, outPrivate tpm2.TPM2BPrivate, outPublic tpm2.TPM2BPublic) (*x509.Certificate, error) {
 
 	var certs [][]byte
 	var parsed []*x509.Certificate
@@ -265,7 +314,7 @@ func storeInTPM(rwc transport.TPM, parentHandle tpm2.TPMHandle, parentName tpm2.
 	}
 
 	if len(certs) < 2 {
-		return fmt.Errorf("expected at least 2 certs, got %d", len(certs))
+		return nil, fmt.Errorf("expected at least 2 certs, got %d", len(certs))
 	}
 
 	clientCert := certs[0]
@@ -283,10 +332,10 @@ func storeInTPM(rwc transport.TPM, parentHandle tpm2.TPMHandle, parentName tpm2.
 
 	// For demo: write to files (in production: NV or sealed objects)
 	if err := os.WriteFile("client.crt", clientCert, 0600); err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.WriteFile("internal-ca.crt", caCert, 0600); err != nil {
-		return err
+		return nil, err
 	}
 
 	log.Println("\nCertificate details:")
@@ -296,5 +345,57 @@ func storeInTPM(rwc transport.TPM, parentHandle tpm2.TPMHandle, parentName tpm2.
 		clientCertObj.NotBefore, clientCertObj.NotAfter)
 	log.Printf("  CA cert valid: %v - %v\n",
 		caCertObj.NotBefore, caCertObj.NotAfter)
-	return nil
+	return clientCertObj, nil
+}
+func controlLoop(clientCert *x509.Certificate, signer crypto.Signer) {
+	for {
+		log.Println("Connecting to control plane...")
+
+		caPEM, _ := os.ReadFile("internal-ca.crt")
+		caPool := x509.NewCertPool()
+		caPool.AppendCertsFromPEM(caPEM)
+
+		tlsCert := tls.Certificate{
+			Certificate: [][]byte{clientCert.Raw},
+			PrivateKey:  signer, // 🔐 TPM-backed key
+		}
+
+		cfg := &tls.Config{
+			Certificates: []tls.Certificate{tlsCert},
+			RootCAs:      caPool,
+			ServerName:   "controller.local",
+			MinVersion:   tls.VersionTLS12,
+		}
+
+		conn, err := tls.Dial("tcp", "controller.local:9443", cfg)
+		if err != nil {
+			log.Println("control connect failed, retrying:", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		log.Println("🔐 Control plane connected")
+
+		buf := make([]byte, 4096)
+		go func() {
+			for {
+				_, err := conn.Write([]byte(`{"type":"ping"}` + "\n"))
+				if err != nil {
+					conn.Close()
+					return
+				}
+				time.Sleep(5 * time.Second)
+			}
+		}()
+
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				log.Println("control lost, reconnecting")
+				conn.Close()
+				break
+			}
+			log.Println("control:", string(buf[:n]))
+		}
+	}
 }
