@@ -1,0 +1,29 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.so.*
+*.dylib
+*.o
+*.a
+
+# Build output
+/bin/
+/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Generated certificates/keys (sensitive)
+*.pem
+*.crt
+*.key
+*.csr
+*.srl
+
+# Go
+*.out
