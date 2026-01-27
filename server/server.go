@@ -169,11 +169,16 @@ func startControlPlane() {
 	serverCert, _ := tls.LoadX509KeyPair("server-mtls.crt", "server-mtls.key")
 
 	cfg := &tls.Config{
-		Certificates: []tls.Certificate{serverCert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    caPool,
-		MinVersion:   tls.VersionTLS12,
-	}
+    Certificates: []tls.Certificate{serverCert},
+    ClientAuth:   tls.RequireAndVerifyClientCert,
+    ClientCAs:    caPool,
+    MinVersion:   tls.VersionTLS12,
+    MaxVersion:   tls.VersionTLS12,
+    CipherSuites: []uint16{
+        tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+    },
+}
+
 
 	ln, err := tls.Listen("tcp", ":9443", cfg)
 	if err != nil {
