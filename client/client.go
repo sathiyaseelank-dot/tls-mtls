@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -58,65 +58,61 @@ func shouldReEnroll(cert *x509.Certificate, pub *rsa.PublicKey) bool {
 }
 
 func (k *TPMKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	hashFunc := opts.HashFunc()
+	var hashAlg tpm2.TPMAlgID
 
-	if opts.HashFunc() != crypto.SHA256 {
-		return nil, fmt.Errorf("unsupported hash: %v", opts.HashFunc())
+	switch hashFunc {
+	case crypto.SHA256:
+		hashAlg = tpm2.TPMAlgSHA256
+	case crypto.SHA384:
+		hashAlg = tpm2.TPMAlgSHA384
+	case crypto.SHA512:
+		hashAlg = tpm2.TPMAlgSHA512
+	default:
+		return nil, fmt.Errorf("unsupported hash algorithm: %v", hashFunc)
 	}
 
-	// ASN.1 DigestInfo for SHA256
-	digestInfoPrefix := []byte{
-		0x30, 0x31,
-		0x30, 0x0d,
-		0x06, 0x09,
-		0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-		0x05, 0x00,
-		0x04, 0x20,
+	// Verify digest length matches hash algorithm
+	expectedLen := hashFunc.Size()
+	if len(digest) != expectedLen {
+		return nil, fmt.Errorf("digest length mismatch: got %d, want %d", len(digest), expectedLen)
 	}
 
-	t := append(digestInfoPrefix, digest...)
-
-	// modulus length in bytes
-	klen := (k.pub.(*rsa.PublicKey).N.BitLen() + 7) / 8
-	if len(t) > klen-11 {
-		return nil, fmt.Errorf("message too long")
+	sigScheme := tpm2.TPMTSigScheme{
+		Scheme: tpm2.TPMAlgRSASSA,
+		Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgRSASSA, &tpm2.TPMSSchemeHash{
+			HashAlg: hashAlg,
+		}),
 	}
 
-	// PKCS#1 v1.5 padding
-	ps := bytes.Repeat([]byte{0xff}, klen-len(t)-3)
-	em := append([]byte{0x00, 0x01}, ps...)
-	em = append(em, 0x00)
-	em = append(em, t...)
-
-	rsp, err := tpm2.Sign{
+	cmd := tpm2.Sign{
 		KeyHandle: tpm2.AuthHandle{
 			Handle: k.handle,
 			Name:   k.name,
 			Auth:   tpm2.PasswordAuth(nil),
 		},
-		Digest: tpm2.TPM2BDigest{Buffer: em},
-
-		// RAW RSA
-		InScheme: tpm2.TPMTSigScheme{
-			Scheme: tpm2.TPMAlgNull,
-		},
-
+		Digest:   tpm2.TPM2BDigest{Buffer: digest},
+		InScheme: sigScheme,
 		Validation: tpm2.TPMTTKHashCheck{
-			Tag:       tpm2.TPMSTHashCheck,
-			Hierarchy: tpm2.TPMRHNull,
+			Tag: tpm2.TPMSTHashCheck,
 		},
-	}.Execute(k.tpm)
-
-	if err != nil {
-		return nil, err
 	}
 
-	sig, err := rsp.Signature.Signature.RSASSA()
+	rsp, err := cmd.Execute(k.tpm)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("TPM Sign failed: %w", err)
 	}
-	return sig.Sig.Buffer, nil
+
+	rsaSig, err := rsp.Signature.Signature.RSASSA()
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract RSASSA signature: %w", err)
+	}
+
+	sig := rsaSig.Sig.Buffer
+	log.Printf("TPM Sign: input digest %d bytes → output signature %d bytes (hash: %v)",
+		len(digest), len(sig), hashFunc)
+	return sig, nil
 }
-
 func main() {
 	log.Println("=== Connector Enrollment with TPM ===")
 
@@ -208,8 +204,10 @@ func main() {
 				},
 				Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgRSA, &tpm2.TPMSRSAParms{
 					Scheme: tpm2.TPMTRSAScheme{
-						Scheme: tpm2.TPMAlgNull, // 🔥 RAW RSA
-
+						Scheme: tpm2.TPMAlgRSASSA,
+						Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgRSASSA, &tpm2.TPMSSigSchemeRSASSA{
+							HashAlg: tpm2.TPMAlgSHA256,
+						}),
 					},
 					KeyBits: 2048,
 				}),
@@ -273,6 +271,25 @@ func main() {
 	}
 
 	signer := &TPMKey{tpm: rwc, handle: keyHandle, name: keyName, pub: pubKey}
+
+	// Test the signer before attempting TLS
+	testData := []byte("test message")
+	hash := sha256.Sum256(testData)
+	testSig, err := signer.Sign(rand.Reader, hash[:], crypto.SHA256)
+	if err != nil {
+		log.Printf("⚠️  TPM sign test failed: %v", err)
+	} else {
+		log.Printf("✓ TPM sign test successful: %d bytes", len(testSig))
+		// Verify the signature
+		if rsaPub, ok := signer.Public().(*rsa.PublicKey); ok {
+			err = rsa.VerifyPKCS1v15(rsaPub, crypto.SHA256, hash[:], testSig)
+			if err != nil {
+				log.Printf("⚠️  TPM signature verification FAILED: %v", err)
+			} else {
+				log.Printf("✓ TPM signature verification successful")
+			}
+		}
+	}
 
 	if skipEnrollment {
 		log.Println("✓ Enrollment skipped — using existing certificate")
@@ -431,14 +448,16 @@ func controlLoop(clientCert *x509.Certificate, signer crypto.Signer, rwc transpo
 			PrivateKey:  signer, // 🔐 TPM-backed key
 		}
 
+		// Client config (connector)
 		cfg := &tls.Config{
 			Certificates: []tls.Certificate{tlsCert},
 			RootCAs:      caPool,
 			ServerName:   "controller.local",
 			MinVersion:   tls.VersionTLS12,
-			MaxVersion:   tls.VersionTLS12, // 🔥 force TLS1.2
+			MaxVersion:   tls.VersionTLS12,
 			CipherSuites: []uint16{
-				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 			},
 		}
 

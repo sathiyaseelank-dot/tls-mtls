@@ -168,17 +168,18 @@ func startControlPlane() {
 
 	serverCert, _ := tls.LoadX509KeyPair("server-mtls.crt", "server-mtls.key")
 
+	// Server config (controller.go)
 	cfg := &tls.Config{
-    Certificates: []tls.Certificate{serverCert},
-    ClientAuth:   tls.RequireAndVerifyClientCert,
-    ClientCAs:    caPool,
-    MinVersion:   tls.VersionTLS12,
-    MaxVersion:   tls.VersionTLS12,
-    CipherSuites: []uint16{
-        tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-    },
-}
-
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    caPool,
+		MinVersion:   tls.VersionTLS12,
+		MaxVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		},
+	}
 
 	ln, err := tls.Listen("tcp", ":9443", cfg)
 	if err != nil {
