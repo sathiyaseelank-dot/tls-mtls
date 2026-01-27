@@ -294,6 +294,7 @@ func storeInTPM(rwc transport.TPM, parentHandle tpm2.TPMHandle, parentName tpm2.
 	log.Printf("  CA cert: CN=%s\n", caCertObj.Subject.CommonName)
 	log.Printf("  Client cert valid: %v - %v\n",
 		clientCertObj.NotBefore, clientCertObj.NotAfter)
-
+	log.Printf("  CA cert valid: %v - %v\n",
+		caCertObj.NotBefore, caCertObj.NotAfter)
 	return nil
 }
