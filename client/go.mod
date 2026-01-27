@@ -1,4 +1,4 @@
-module client-1
+module client-2
 
 go 1.25.1
 

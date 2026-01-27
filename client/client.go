@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -29,39 +30,91 @@ type TPMKey struct {
 
 func (k *TPMKey) Public() crypto.PublicKey { return k.pub }
 
-func (k *TPMKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
-	sigScheme := tpm2.TPMTSigScheme{
-		Scheme: tpm2.TPMAlgRSASSA,
-		Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgRSASSA, &tpm2.TPMSSchemeHash{
-			HashAlg: tpm2.TPMAlgSHA256,
-		}),
+func shouldReEnroll(cert *x509.Certificate, pub *rsa.PublicKey) bool {
+	// 1) expired or not yet valid
+	now := time.Now()
+	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+		log.Println("🔁 cert expired or not yet valid")
+		return true
 	}
 
-	cmd := tpm2.Sign{
+	// 2) 70% lifetime passed
+	lifetime := cert.NotAfter.Sub(cert.NotBefore)
+	age := now.Sub(cert.NotBefore)
+	if age > (lifetime * 70 / 100) {
+		log.Printf("🔁 cert lifetime %.1f%% — re-enrolling\n", float64(age)*100/float64(lifetime))
+		return true
+	}
+
+	// 3) public key mismatch
+	if rsaCert, ok := cert.PublicKey.(*rsa.PublicKey); ok {
+		if !rsaCert.Equal(pub) {
+			log.Println("🔁 cert key mismatch — re-enrolling")
+			return true
+		}
+	}
+
+	return false
+}
+
+func (k *TPMKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+
+	if opts.HashFunc() != crypto.SHA256 {
+		return nil, fmt.Errorf("unsupported hash: %v", opts.HashFunc())
+	}
+
+	// ASN.1 DigestInfo for SHA256
+	digestInfoPrefix := []byte{
+		0x30, 0x31,
+		0x30, 0x0d,
+		0x06, 0x09,
+		0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+		0x05, 0x00,
+		0x04, 0x20,
+	}
+
+	t := append(digestInfoPrefix, digest...)
+
+	// modulus length in bytes
+	klen := (k.pub.(*rsa.PublicKey).N.BitLen() + 7) / 8
+	if len(t) > klen-11 {
+		return nil, fmt.Errorf("message too long")
+	}
+
+	// PKCS#1 v1.5 padding
+	ps := bytes.Repeat([]byte{0xff}, klen-len(t)-3)
+	em := append([]byte{0x00, 0x01}, ps...)
+	em = append(em, 0x00)
+	em = append(em, t...)
+
+	rsp, err := tpm2.Sign{
 		KeyHandle: tpm2.AuthHandle{
 			Handle: k.handle,
 			Name:   k.name,
 			Auth:   tpm2.PasswordAuth(nil),
 		},
-		Digest:   tpm2.TPM2BDigest{Buffer: digest},
-		InScheme: sigScheme,
-		// ADD THIS: Explicitly define the validation ticket
+		Digest: tpm2.TPM2BDigest{Buffer: em},
+
+		// RAW RSA
+		InScheme: tpm2.TPMTSigScheme{
+			Scheme: tpm2.TPMAlgNull,
+		},
+
 		Validation: tpm2.TPMTTKHashCheck{
 			Tag:       tpm2.TPMSTHashCheck,
-			Hierarchy: tpm2.TPMRHNull, // Use Null Hierarchy for external digests
+			Hierarchy: tpm2.TPMRHNull,
 		},
-	}
+	}.Execute(k.tpm)
 
-	rsp, err := cmd.Execute(k.tpm)
 	if err != nil {
 		return nil, err
 	}
 
-	rsaSig, err := rsp.Signature.Signature.RSASSA()
+	sig, err := rsp.Signature.Signature.RSASSA()
 	if err != nil {
 		return nil, err
 	}
-	return rsaSig.Sig.Buffer, nil
+	return sig.Sig.Buffer, nil
 }
 
 func main() {
@@ -73,225 +126,233 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to open TPM: %v", err)
 	}
-	defer rwc.Close()
+	// Don't close TPM here - controlLoop uses it
+	// rwc stays open for the lifetime of the process
 	log.Println("✓ TPM opened")
 
-	// Try to load persistent key first
-	loadPersist := tpm2.ReadPublic{
+	var keyHandle tpm2.TPMHandle
+	var keyName tpm2.TPM2BName
+	var createRsp *tpm2.CreateResponse
+	var pubKey *rsa.PublicKey
+	var skipEnrollment bool
+	var clientCertObj *x509.Certificate
+
+	// Try load persistent key
+	read := tpm2.ReadPublic{
 		ObjectHandle: tpm2.TPMHandle(0x81000001),
 	}
-	persistRsp, persistErr := loadPersist.Execute(rwc)
-	if persistErr == nil {
-		log.Println("✓ Persistent key found at handle 0x81000001")
-		// Use persistent key instead of creating a new one
-		keyHandle := tpm2.TPMHandle(0x81000001)
-		keyName := persistRsp.Name
-		_ = keyHandle
-		_ = keyName
-		log.Println("✓ Persistent key loaded")
+	if readRsp, err := read.Execute(rwc); err == nil {
+		log.Println("✓ Found persistent TPM key 0x81000001")
+		keyHandle = tpm2.TPMHandle(0x81000001)
+		keyName = readRsp.Name
+
+		// Extract public key from persistent object
+		pubArea, _ := readRsp.OutPublic.Contents()
+		if rsaUnique, _ := pubArea.Unique.RSA(); rsaUnique != nil {
+			n := new(big.Int).SetBytes(rsaUnique.Buffer)
+			pubKey = &rsa.PublicKey{N: n, E: 65537}
+		}
+
+		// Check if we already have a valid certificate
+		if certBytes, err := os.ReadFile("client.crt"); err == nil {
+			if block, _ := pem.Decode(certBytes); block != nil {
+				if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
+					if !shouldReEnroll(cert, pubKey) {
+						log.Println("✓ Valid identity found — skipping enrollment")
+						clientCertObj = cert
+						skipEnrollment = true
+					}
+				}
+			}
+		}
+
+		if !skipEnrollment {
+			log.Println("⚠ Certificate invalid — will re-enroll with persistent key")
+		}
 	}
 
-	// Create primary key under Owner hierarchy
-	inPublic := tpm2.New2B(tpm2.RSASRKTemplate)
+	if keyHandle == 0 && !skipEnrollment {
+		log.Println("No persistent key, creating new one...")
 
-	createPrimaryCmd := tpm2.CreatePrimary{
-		PrimaryHandle: tpm2.AuthHandle{
-			Handle: tpm2.TPMRHOwner,
-			Auth:   tpm2.PasswordAuth(nil),
-		},
-		InPublic: inPublic,
-	}
-
-	createPrimaryRsp, err := createPrimaryCmd.Execute(rwc)
-	if err != nil {
-		log.Fatalf("failed to create primary: %v", err)
-	}
-
-	primaryName := createPrimaryRsp.Name
-	primaryHandle := createPrimaryRsp.ObjectHandle
-	defer func() {
-		flushCmd := tpm2.FlushContext{FlushHandle: primaryHandle}
-		flushCmd.Execute(rwc)
-	}()
-	log.Println("✓ Primary key created")
-
-	// Create a child key under primary for enrollment
-	createCmd := tpm2.Create{
-		ParentHandle: tpm2.AuthHandle{
-			Handle: primaryHandle,
-			Name:   primaryName,
-			Auth:   tpm2.PasswordAuth(nil),
-		},
-		InPublic: tpm2.New2B(tpm2.TPMTPublic{
-			Type:    tpm2.TPMAlgRSA,
-			NameAlg: tpm2.TPMAlgSHA256,
-			ObjectAttributes: tpm2.TPMAObject{
-				SignEncrypt:         true,
-				UserWithAuth:        true,
-				SensitiveDataOrigin: true,
+		// Create primary
+		primaryRsp, err := tpm2.CreatePrimary{
+			PrimaryHandle: tpm2.AuthHandle{
+				Handle: tpm2.TPMRHOwner,
+				Auth:   tpm2.PasswordAuth(nil),
 			},
-			Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgRSA, &tpm2.TPMSRSAParms{
-				Scheme: tpm2.TPMTRSAScheme{
-					Scheme: tpm2.TPMAlgRSASSA,
-					Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgRSASSA, &tpm2.TPMSSigSchemeRSASSA{
-						HashAlg: tpm2.TPMAlgSHA256,
-					}),
+			InPublic: tpm2.New2B(tpm2.RSASRKTemplate),
+		}.Execute(rwc)
+		if err != nil {
+			log.Fatalf("failed to create primary: %v", err)
+		}
+
+		defer func() {
+			flushCmd := tpm2.FlushContext{FlushHandle: primaryRsp.ObjectHandle}
+			flushCmd.Execute(rwc)
+		}()
+
+		// Create child
+		createRsp, err = tpm2.Create{
+			ParentHandle: tpm2.AuthHandle{
+				Handle: primaryRsp.ObjectHandle,
+				Name:   primaryRsp.Name,
+				Auth:   tpm2.PasswordAuth(nil),
+			},
+			InPublic: tpm2.New2B(tpm2.TPMTPublic{
+				Type:    tpm2.TPMAlgRSA,
+				NameAlg: tpm2.TPMAlgSHA256,
+				ObjectAttributes: tpm2.TPMAObject{
+					SignEncrypt:         true,
+					UserWithAuth:        true,
+					SensitiveDataOrigin: true,
 				},
-				KeyBits: 2048,
+				Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgRSA, &tpm2.TPMSRSAParms{
+					Scheme: tpm2.TPMTRSAScheme{
+						Scheme: tpm2.TPMAlgNull, // 🔥 RAW RSA
+
+					},
+					KeyBits: 2048,
+				}),
 			}),
-		}),
+		}.Execute(rwc)
+		if err != nil {
+			log.Fatalf("failed to create key: %v", err)
+		}
+
+		// Load
+		loadRsp, err := tpm2.Load{
+			ParentHandle: tpm2.AuthHandle{
+				Handle: primaryRsp.ObjectHandle,
+				Name:   primaryRsp.Name,
+				Auth:   tpm2.PasswordAuth(nil),
+			},
+			InPrivate: createRsp.OutPrivate,
+			InPublic:  createRsp.OutPublic,
+		}.Execute(rwc)
+		if err != nil {
+			log.Fatalf("failed to load key: %v", err)
+		}
+
+		// Persist
+		_, err = tpm2.EvictControl{
+			Auth: tpm2.AuthHandle{
+				Handle: tpm2.TPMRHOwner,
+				Auth:   tpm2.PasswordAuth(nil),
+			},
+			ObjectHandle: &tpm2.NamedHandle{
+				Handle: loadRsp.ObjectHandle,
+				Name:   loadRsp.Name,
+			},
+			PersistentHandle: tpm2.TPMHandle(0x81000001),
+		}.Execute(rwc)
+		if err != nil {
+			log.Fatal("persist failed:", err)
+		}
+
+		keyHandle = tpm2.TPMHandle(0x81000001)
+		keyName = loadRsp.Name
+		log.Println("✓ TPM key created + persisted at 0x81000001")
 	}
 
-	createRsp, err := createCmd.Execute(rwc)
-	if err != nil {
-		log.Fatalf("failed to create key: %v", err)
-	}
+	// Extract public key from newly created key if not using persistent
+	if pubKey == nil {
+		pubArea, err := createRsp.OutPublic.Contents()
+		if err != nil {
+			log.Fatalf("failed to extract public area: %v", err)
+		}
+		rsaUnique, err := pubArea.Unique.RSA()
+		if err != nil {
+			log.Fatalf("failed to get RSA unique: %v", err)
+		}
 
-	// Load the key into the TPM
-	loadCmd := tpm2.Load{
-		ParentHandle: tpm2.AuthHandle{
-			Handle: primaryHandle,
-			Name:   primaryName,
-			Auth:   tpm2.PasswordAuth(nil),
-		},
-		InPrivate: createRsp.OutPrivate,
-		InPublic:  createRsp.OutPublic,
-	}
-
-	loadRsp, err := loadCmd.Execute(rwc)
-	if err != nil {
-		log.Fatalf("failed to load key: %v", err)
-	}
-	keyName := loadRsp.Name
-	keyHandle := loadRsp.ObjectHandle
-	defer func() {
-		flushCmd := tpm2.FlushContext{FlushHandle: keyHandle}
-		flushCmd.Execute(rwc)
-	}()
-	log.Println("✓ Enrollment key created and loaded in TPM")
-
-	// Evict old persistent key if it exists
-	evict := tpm2.EvictControl{
-		Auth: tpm2.AuthHandle{
-			Handle: tpm2.TPMRHOwner,
-			Auth:   tpm2.PasswordAuth(nil),
-		},
-		ObjectHandle: &tpm2.NamedHandle{
-			Handle: tpm2.TPMHandle(0x81000001),
-		},
-		PersistentHandle: tpm2.TPMHandle(0x81000001),
-	}
-	evict.Execute(rwc) // ignore error if key doesn't exist
-
-	persist := tpm2.EvictControl{
-		Auth: tpm2.AuthHandle{
-			Handle: tpm2.TPMRHOwner,
-			Auth:   tpm2.PasswordAuth(nil),
-		},
-		ObjectHandle: &tpm2.NamedHandle{
-			Handle: keyHandle,
-			Name:   keyName,
-		},
-		PersistentHandle: tpm2.TPMHandle(0x81000001),
-	}
-	if _, err := persist.Execute(rwc); err != nil {
-		log.Fatal("persist failed:", err)
-	}
-	log.Println("✓ Enrollment key persisted at handle 0x81000001")
-	// Extract public key for CSR signing
-	pubArea, err := createRsp.OutPublic.Contents()
-	if err != nil {
-		log.Fatalf("failed to extract public area: %v", err)
-	}
-	rsaUnique, err := pubArea.Unique.RSA()
-	if err != nil {
-		log.Fatalf("failed to get RSA unique: %v", err)
-	}
-
-	n := new(big.Int).SetBytes(rsaUnique.Buffer)
-	pubKey := &rsa.PublicKey{
-		N: n,
-		E: 65537,
+		n := new(big.Int).SetBytes(rsaUnique.Buffer)
+		pubKey = &rsa.PublicKey{
+			N: n,
+			E: 65537,
+		}
 	}
 
 	signer := &TPMKey{tpm: rwc, handle: keyHandle, name: keyName, pub: pubKey}
 
-	// Create CSR signed by TPM key
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader,
-		&x509.CertificateRequest{
-			Subject: pkix.Name{CommonName: "connector01"},
-		}, signer)
-	if err != nil {
-		log.Fatalf("failed to create CSR: %v", err)
-	}
-
-	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
-	log.Println("✓ CSR created and signed by TPM key")
-
-	// Load root CA for TLS verification
-	caCert, err := os.ReadFile("ca.crt")
-	if err != nil {
-		log.Fatalf("failed to read ca.crt: %v", err)
-	}
-	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(caCert)
-
-	// Connect to enrollment server via TLS (server.crt verified by ca.crt)
-	cfg := &tls.Config{
-		RootCAs:    pool,
-		ServerName: "controller.local",
-		MinVersion: tls.VersionTLS12,
-	}
-	log.Println("Connecting to enrollment server...")
-	conn, err := tls.Dial("tcp", "controller.local:8443", cfg)
-	if err != nil {
-		log.Fatalf("TLS connect failed: %v", err)
-	}
-	defer conn.Close()
-	log.Println("✓ TLS connection established (server.crt verified by ca.crt)")
-
-	// Send CSR to server
-	log.Println("Sending CSR to server...")
-	_, err = conn.Write(csrPEM)
-	if err != nil {
-		log.Fatalf("send failed: %v", err)
-	}
-
-	// Receive certificate bundle from server
-	// (contains: client.crt signed by internal-ca, and internal-ca.crt chain)
-	log.Println("Receiving certificate bundle from server...")
-	var bundle []byte
-	buf := make([]byte, 4096)
-
-	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			bundle = append(bundle, buf[:n]...)
-		}
+	if skipEnrollment {
+		log.Println("✓ Enrollment skipped — using existing certificate")
+	} else {
+		// Create CSR signed by TPM key
+		csrDER, err := x509.CreateCertificateRequest(rand.Reader,
+			&x509.CertificateRequest{
+				Subject: pkix.Name{CommonName: "connector01"},
+			}, signer)
 		if err != nil {
-			break
+			log.Fatalf("failed to create CSR: %v", err)
 		}
-	}
 
-	log.Printf("✓ Received %d bytes (client.crt + internal-ca.crt)", len(bundle))
+		csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+		log.Println("✓ CSR created and signed by TPM key")
 
-	// Store certificates and key in TPM
-	clientCertObj, err := storeInTPM(rwc, primaryHandle, primaryName, bundle, createRsp.OutPrivate, createRsp.OutPublic)
-	if err != nil {
-		log.Fatalf("failed to store in TPM: %v", err)
+		// Load root CA for TLS verification
+		caCert, err := os.ReadFile("../ca/ca.crt")
+		if err != nil {
+			log.Fatalf("failed to read ca.crt: %v", err)
+		}
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(caCert)
+
+		// Connect to enrollment server via TLS (server.crt verified by ca.crt)
+		cfg := &tls.Config{
+			RootCAs:    pool,
+			ServerName: "controller.local",
+			MinVersion: tls.VersionTLS12,
+		}
+		log.Println("Connecting to enrollment server...")
+		conn, err := tls.Dial("tcp", "controller.local:8443", cfg)
+		if err != nil {
+			log.Fatalf("TLS connect failed: %v", err)
+		}
+		defer conn.Close()
+		log.Println("✓ TLS connection established (server.crt verified by ca.crt)")
+
+		// Send CSR to server
+		log.Println("Sending CSR to server...")
+		_, err = conn.Write(csrPEM)
+		if err != nil {
+			log.Fatalf("send failed: %v", err)
+		}
+
+		// Receive certificate bundle from server
+		// (contains: client.crt signed by internal-ca, and internal-ca.crt chain)
+		log.Println("Receiving certificate bundle from server...")
+		var bundle []byte
+		buf := make([]byte, 4096)
+
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				bundle = append(bundle, buf[:n]...)
+			}
+			if err != nil {
+				break
+			}
+		}
+
+		log.Printf("✓ Received %d bytes (client.crt + internal-ca.crt)", len(bundle))
+
+		// Store certificates and key in TPM
+		clientCertObj, err = storeInTPM(bundle, pubKey)
+		if err != nil {
+			log.Fatalf("failed to store in TPM: %v", err)
+		}
 	}
 
 	log.Println("✓ Enrollment complete!")
 	log.Println("✓ Certificates and key stored in TPM")
 
-	go controlLoop(clientCertObj, signer)
+	go controlLoop(clientCertObj, signer, rwc)
 
 	select {} // block forever
 
 }
 
-func storeInTPM(rwc transport.TPM, parentHandle tpm2.TPMHandle, parentName tpm2.TPM2BName,
-	bundle []byte, outPrivate tpm2.TPM2BPrivate, outPublic tpm2.TPM2BPublic) (*x509.Certificate, error) {
+func storeInTPM(bundle []byte, expectedPubKey *rsa.PublicKey) (*x509.Certificate, error) {
 
 	var certs [][]byte
 	var parsed []*x509.Certificate
@@ -325,6 +386,16 @@ func storeInTPM(rwc transport.TPM, parentHandle tpm2.TPMHandle, parentName tpm2.
 	log.Printf("  - Client cert: %s\n", clientCertObj.Subject.CommonName)
 	log.Printf("  - CA cert: %s\n", caCertObj.Subject.CommonName)
 
+	// Verify certificate public key matches TPM public key
+	if rsaCert, ok := clientCertObj.PublicKey.(*rsa.PublicKey); ok {
+		if !rsaCert.Equal(expectedPubKey) {
+			log.Printf("⚠️  WARNING: Certificate public key does NOT match TPM public key!")
+			log.Printf("   Cert N=%d bits, TPM N=%d bits", rsaCert.N.BitLen(), expectedPubKey.N.BitLen())
+		} else {
+			log.Println("✓ Certificate public key matches TPM key")
+		}
+	}
+
 	log.Println("\nStoring in TPM:")
 	log.Println("  1. Storing private key...")
 	log.Println("  2. Storing client certificate...")
@@ -347,11 +418,11 @@ func storeInTPM(rwc transport.TPM, parentHandle tpm2.TPMHandle, parentName tpm2.
 		caCertObj.NotBefore, caCertObj.NotAfter)
 	return clientCertObj, nil
 }
-func controlLoop(clientCert *x509.Certificate, signer crypto.Signer) {
+func controlLoop(clientCert *x509.Certificate, signer crypto.Signer, rwc transport.TPM) {
 	for {
 		log.Println("Connecting to control plane...")
 
-		caPEM, _ := os.ReadFile("internal-ca.crt")
+		caPEM, _ := os.ReadFile("../internal-ca/internal-ca.crt")
 		caPool := x509.NewCertPool()
 		caPool.AppendCertsFromPEM(caPEM)
 
@@ -365,6 +436,10 @@ func controlLoop(clientCert *x509.Certificate, signer crypto.Signer) {
 			RootCAs:      caPool,
 			ServerName:   "controller.local",
 			MinVersion:   tls.VersionTLS12,
+			MaxVersion:   tls.VersionTLS12, // 🔥 force TLS1.2
+			CipherSuites: []uint16{
+				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+			},
 		}
 
 		conn, err := tls.Dial("tcp", "controller.local:9443", cfg)
@@ -376,9 +451,20 @@ func controlLoop(clientCert *x509.Certificate, signer crypto.Signer) {
 
 		log.Println("🔐 Control plane connected")
 
+		// Send initial connection message immediately
+		_, err = conn.Write([]byte(`{"type":"ping"}` + "\n"))
+		if err != nil {
+			log.Println("control write failed:", err)
+			conn.Close()
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
 		buf := make([]byte, 4096)
 		go func() {
-			for {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
 				_, err := conn.Write([]byte(`{"type":"ping"}` + "\n"))
 				if err != nil {
 					conn.Close()
