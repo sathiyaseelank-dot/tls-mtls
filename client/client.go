@@ -59,8 +59,8 @@ func shouldReEnroll(cert *x509.Certificate, pub *rsa.PublicKey) bool {
 
 func (k *TPMKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
 	hashFunc := opts.HashFunc()
-	var hashAlg tpm2.TPMAlgID
 
+	var hashAlg tpm2.TPMAlgID
 	switch hashFunc {
 	case crypto.SHA256:
 		hashAlg = tpm2.TPMAlgSHA256
@@ -72,17 +72,34 @@ func (k *TPMKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]
 		return nil, fmt.Errorf("unsupported hash algorithm: %v", hashFunc)
 	}
 
-	// Verify digest length matches hash algorithm
-	expectedLen := hashFunc.Size()
-	if len(digest) != expectedLen {
-		return nil, fmt.Errorf("digest length mismatch: got %d, want %d", len(digest), expectedLen)
+	if len(digest) != hashFunc.Size() {
+		return nil, fmt.Errorf("digest length mismatch")
 	}
 
-	sigScheme := tpm2.TPMTSigScheme{
-		Scheme: tpm2.TPMAlgRSASSA,
-		Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgRSASSA, &tpm2.TPMSSchemeHash{
-			HashAlg: hashAlg,
-		}),
+	var sigScheme tpm2.TPMTSigScheme
+
+	// 🔑 SELECT SIGNATURE SCHEME BASED ON TLS REQUEST
+	switch opts.(type) {
+
+	case *rsa.PSSOptions:
+		// ✅ RSA-PSS (required for Go TLS)
+		sigScheme = tpm2.TPMTSigScheme{
+			Scheme: tpm2.TPMAlgRSAPSS,
+			Details: tpm2.NewTPMUSigScheme(
+				tpm2.TPMAlgRSAPSS,
+				&tpm2.TPMSSchemeHash{HashAlg: hashAlg},
+			),
+		}
+
+	default:
+		// ✅ PKCS#1 v1.5
+		sigScheme = tpm2.TPMTSigScheme{
+			Scheme: tpm2.TPMAlgRSASSA,
+			Details: tpm2.NewTPMUSigScheme(
+				tpm2.TPMAlgRSASSA,
+				&tpm2.TPMSSchemeHash{HashAlg: hashAlg},
+			),
+		}
 	}
 
 	cmd := tpm2.Sign{
@@ -103,16 +120,19 @@ func (k *TPMKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]
 		return nil, fmt.Errorf("TPM Sign failed: %w", err)
 	}
 
-	rsaSig, err := rsp.Signature.Signature.RSASSA()
-	if err != nil {
-		return nil, fmt.Errorf("failed to extract RSASSA signature: %w", err)
+	switch sigScheme.Scheme {
+	case tpm2.TPMAlgRSAPSS:
+		pss, _ := rsp.Signature.Signature.RSAPSS()
+		return pss.Sig.Buffer, nil
+
+	case tpm2.TPMAlgRSASSA:
+		rsaSig, _ := rsp.Signature.Signature.RSASSA()
+		return rsaSig.Sig.Buffer, nil
 	}
 
-	sig := rsaSig.Sig.Buffer
-	log.Printf("TPM Sign: input digest %d bytes → output signature %d bytes (hash: %v)",
-		len(digest), len(sig), hashFunc)
-	return sig, nil
+	return nil, fmt.Errorf("unknown signature scheme")
 }
+
 func main() {
 	log.Println("=== Connector Enrollment with TPM ===")
 
@@ -204,10 +224,7 @@ func main() {
 				},
 				Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgRSA, &tpm2.TPMSRSAParms{
 					Scheme: tpm2.TPMTRSAScheme{
-						Scheme: tpm2.TPMAlgRSASSA,
-						Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgRSASSA, &tpm2.TPMSSigSchemeRSASSA{
-							HashAlg: tpm2.TPMAlgSHA256,
-						}),
+						Scheme: tpm2.TPMAlgNull,
 					},
 					KeyBits: 2048,
 				}),
@@ -449,12 +466,26 @@ func controlLoop(clientCert *x509.Certificate, signer crypto.Signer, rwc transpo
 		}
 
 		// Client config (connector)
+		// cfg := &tls.Config{
+		// 	Certificates: []tls.Certificate{tlsCert},
+		// 	RootCAs:      caPool,
+		// 	ServerName:   "controller.local",
+		// 	MinVersion:   tls.VersionTLS12,
+		// 	MaxVersion:   tls.VersionTLS12,
+		// 	CipherSuites: []uint16{
+		// 		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		// 		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		// 	},
+		// }
+
 		cfg := &tls.Config{
 			Certificates: []tls.Certificate{tlsCert},
 			RootCAs:      caPool,
 			ServerName:   "controller.local",
-			MinVersion:   tls.VersionTLS12,
-			MaxVersion:   tls.VersionTLS12,
+
+			MinVersion: tls.VersionTLS12,
+			MaxVersion: tls.VersionTLS12,
+
 			CipherSuites: []uint16{
 				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,

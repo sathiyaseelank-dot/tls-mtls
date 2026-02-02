@@ -1,0 +1,32 @@
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+tpm2 = tpm2_sect
+default = default_sect
+
+[tpm2_sect]
+activate = 1
+
+[default_sect]
+activate = 1
+
+[req]
+default_bits = 2048
+prompt = no
+distinguished_name = dn
+req_extensions = req_ext
+
+[dn]
+C = IN
+ST = TamilNadu
+L = Chennai
+O = TPM Lab
+OU = Client
+CN = tpm-client.local
+
+[req_ext]
+keyUsage = critical, digitalSignature
+extendedKeyUsage = clientAuth
